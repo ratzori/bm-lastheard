@@ -2,7 +2,20 @@
 
 ## Usage:
 
-`bm-lastheard.py [-h] [-c CALLSIGN] [-t TALKGROUP] [-p PEER] [-n] [-l] [-r RUNTIME]`
+### Python:
+`python3 bm-lastheard.py [-h] [-c CALLSIGN] [-t TALKGROUP] [-p PEER] [-n] [-l] [-r RUNTIME]`
+
+### Docker:
+```bash
+# Build the image
+docker build -t bm-lastheard .
+
+# Run
+docker run -it bm-lastheard [OPTIONS]
+
+# Persist logs
+docker run -it -v $(pwd)/logs:/app/logs bm-lastheard -l [OPTIONS]
+```
 
 ## Options:
 ```
@@ -16,20 +29,21 @@
 -l, --log             Enable logging to logs/ directory
 -r RUNTIME, --runtime RUNTIME
                       Run for specified minutes then exit automatically
+-v, --verbose         Show verbose socketio/engineio messages
 ```
 ## Examples:
-```
-bm-lastheard.py                           # Monitor all worldwide activity
-bm-lastheard.py -c OH                     # Filter by callsign prefix (OH for Finland)
-bm-lastheard.py -t 91                     # Monitor TG 91 (Worldwide)
-bm-lastheard.py -t 244                    # Monitor TG 244 (Finland National)
-bm-lastheard.py -p 2441                   # Monitor BrandMeister master 2441 (Finland)
-bm-lastheard.py -c OH -t 244              # Finnish stations on TG 244
-bm-lastheard.py -p 2441 -t 91             # TG 91 activity through Finnish master
-bm-lastheard.py -n                        # Show first names in output
-bm-lastheard.py -l                        # Enable logging to logs/ folder
-bm-lastheard.py -l -r 60                  # Log for 60 minutes then exit
-bm-lastheard.py -t 244 -n -l -r 30        # Finnish TG with names, log 30 minutes
+```bash
+bm-lastheard                      # Monitor all worldwide activity
+bm-lastheard -c OH                # Filter by callsign prefix (OH for Finland)
+bm-lastheard -t 91                # Monitor TG 91 (Worldwide)
+bm-lastheard -t 244               # Monitor TG 244 (Finland National)
+bm-lastheard -p 2441              # Monitor BrandMeister master 2441 (Finland)
+bm-lastheard -c OH -t 244         # Finnish stations on TG 244
+bm-lastheard -p 2441 -t 91        # TG 91 activity through Finnish master
+bm-lastheard -n                   # Show first names in output
+bm-lastheard -l                   # Enable logging to logs/ folder
+bm-lastheard -l -r 60             # Log for 60 minutes then exit
+bm-lastheard -t 244 -n -l -r 30   # Finnish TG with names, log 30 minutes
 ```
 
 ## Filters:
@@ -44,6 +58,7 @@ bm-lastheard.py -t 244 -n -l -r 30        # Finnish TG with names, log 30 minute
 -n/--name      : Add first name column to output
 -l/--log       : Write timestamped log file to logs/ directory
 -r/--runtime   : Run for specified minutes then exit (useful with -l)
+-v/--verbose   : Show verbose socketio/engineio messages
 ```
 
 ## Common Talkgroups:
