@@ -7,10 +7,12 @@ import argparse
 import sys
 import time
 import json
-import threading
 import select
+import termios
+import tty
 import csv
 import os
+import logging
 from pathlib import Path
 
 BM_PEER_URL = "https://api.brandmeister.network/v2/device/"
@@ -100,7 +102,7 @@ def format_timestamp(ts):
     dt = datetime.fromtimestamp(ts, timezone.utc)
     return dt.strftime("%H:%M:%S")
 
-def main(callsign_filter=None, dest_filter=None, peer_filter=None, show_name=False, enable_logging=False, runtime_minutes=None):
+def main(callsign_filter=None, dest_filter=None, peer_filter=None, show_name=False, enable_logging=False, runtime_minutes=None, verbose=False):
     # Load DMR database first
     load_dmr_database()
 
@@ -142,66 +144,71 @@ def main(callsign_filter=None, dest_filter=None, peer_filter=None, show_name=Fal
         print(f"Filters: {', '.join(filters_active)}", file=sys.stderr)
     print("Press 'q' or ESC to quit (Ctrl+C also works)...\n", file=sys.stderr)
 
-    stop_flag = threading.Event()
     sio = None
-
-    def keyboard_listener():
-        # Only enable keyboard control if stdin is a TTY
-        if not sys.stdin.isatty():
-            return
-
-        import termios
-        import tty
-
+    header_printed = {'value': False}
+    should_exit = {'value': False}
+    
+    # Setup non-blocking keyboard input
+    old_settings = None
+    if sys.stdin.isatty():
         old_settings = termios.tcgetattr(sys.stdin)
-        try:
-            tty.setcbreak(sys.stdin.fileno())
-            while not stop_flag.is_set():
-                if select.select([sys.stdin], [], [], 0.1)[0]:
-                    char = sys.stdin.read(1)
-                    if char in ('q', 'Q', '\x1b'):  # q, Q, or ESC
-                        stop_flag.set()
-                        if sio:
-                            sio.disconnect()
-                        break
-        finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-
-    # Start keyboard listener thread
-    kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
-    kb_thread.start()
+        tty.setcbreak(sys.stdin.fileno())
+    
+    def check_keyboard():
+        """Check for q or ESC key press, non-blocking"""
+        if not sys.stdin.isatty():
+            return False
+        if select.select([sys.stdin], [], [], 0)[0]:
+            char = sys.stdin.read(1)
+            if char in ('q', 'Q', '\x1b'):
+                return True
+        return False
 
     # Connect to WebSocket
     try:
-        sio = socketio.Client()
+        sio = socketio.Client(
+            logger=False, 
+            engineio_logger=False,
+            reconnection=False  # We handle reconnection manually
+        )
+        # Suppress engineio messages unless verbose mode
+        if not verbose:
+            sio.eio.logger.setLevel(logging.CRITICAL)
     except Exception as e:
         print(f"Error initializing socketio client: {e}", file=sys.stderr)
         sys.exit(1)
 
     @sio.event
     def connect():
-        print("Connected to BrandMeister...", file=sys.stderr)
-        if show_name:
-            header = "UTC      | DMR ID   | Callsign | Repeater/Node     | Talkgroup | Country            | City              | Name"
-            separator = "-" * 121
+        if not header_printed['value']:
+            print("Connected to BrandMeister...", file=sys.stderr)
+            if show_name:
+                header = "UTC      | DMR ID   | Callsign | Repeater/Node     | Talkgroup | Country            | City              | Name"
+                separator = "-" * 121
+            else:
+                header = "UTC      | DMR ID   | Callsign | Repeater/Node     | Talkgroup | Country            | City"
+                separator = "-" * 96
+
+            print(f"\n{header}", file=sys.stderr)
+            print(separator, file=sys.stderr)
+
+            # Write header to log file if logging is enabled
+            if log_state['file'] and not log_state['file'].closed:
+                print(header, file=log_state['file'])
+                print(separator, file=log_state['file'])
+                log_state['file'].flush()
+            
+            header_printed['value'] = True
         else:
-            header = "UTC      | DMR ID   | Callsign | Repeater/Node     | Talkgroup | Country            | City"
-            separator = "-" * 96
+            print("Reconnected to BrandMeister...", file=sys.stderr)
 
-        print(f"\n{header}", file=sys.stderr)
-        print(separator, file=sys.stderr)
-
-        # Write header to log file if logging is enabled
-        if log_state['file'] and not log_state['file'].closed:
-            print(header, file=log_state['file'])
-            print(separator, file=log_state['file'])
-            log_state['file'].flush()
+    @sio.event
+    def disconnect():
+        if not should_exit['value']:
+            print("\nConnection lost...", file=sys.stderr)
 
     @sio.on('mqtt')
     def on_mqtt(data):
-        if stop_flag.is_set():
-            return
-
         if 'payload' in data and isinstance(data['payload'], str):
             try:
                 entry = json.loads(data['payload'])
@@ -328,26 +335,74 @@ def main(callsign_filter=None, dest_filter=None, peer_filter=None, show_name=Fal
             except json.JSONDecodeError:
                 pass
 
+    # Main connection loop
     try:
-        sio.connect('https://api.brandmeister.network', socketio_path='/lh/socket.io', transports=['websocket'])
-
-        # Keep running until stop_flag is set or time expires
-        while not stop_flag.is_set() and sio.connected:
-            # Check if runtime has expired
-            if end_time and time.time() >= end_time:
-                print("\nRuntime expired, shutting down...", file=sys.stderr)
-                stop_flag.set()
+        retry_immediately = True
+        while not should_exit['value']:
+            if check_keyboard():
                 break
-            time.sleep(0.1)
+                
+            try:
+                sio.connect('https://api.brandmeister.network', 
+                           socketio_path='/lh/socket.io', 
+                           transports=['websocket'],
+                           wait_timeout=10)
+                
+                # Connected successfully, reset retry flag
+                retry_immediately = True
+                
+                # Stay connected
+                while sio.connected and not should_exit['value']:
+                    if end_time and time.time() >= end_time:
+                        print("\nRuntime expired, shutting down...", file=sys.stderr)
+                        should_exit['value'] = True
+                        break
+                    if check_keyboard():
+                        should_exit['value'] = True
+                        break
+                    time.sleep(0.1)
+                
+                if should_exit['value']:
+                    break
+                
+                # Connection dropped, retry immediately first time
+                if not retry_immediately:
+                    print(f"Retrying in 5 seconds...", file=sys.stderr)
+                    for _ in range(50):
+                        if check_keyboard():
+                            should_exit['value'] = True
+                            break
+                        time.sleep(0.1)
+                    if should_exit['value']:
+                        break
+                    
+            except Exception as e:
+                if check_keyboard():
+                    should_exit['value'] = True
+                    break
+                
+                # Connection attempt failed
+                if retry_immediately:
+                    retry_immediately = False
+                    continue
+                    
+                # Subsequent failures: wait before retry
+                print(f"Retrying in 5 seconds...", file=sys.stderr)
+                for _ in range(50):
+                    if check_keyboard():
+                        should_exit['value'] = True
+                        break
+                    time.sleep(0.1)
+                if should_exit['value']:
+                    break
 
-        sio.disconnect()
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f"\nError: {e}", file=sys.stderr)
     finally:
-        stop_flag.set()
-        kb_thread.join(timeout=1)
+        if old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        if sio and sio.connected:
+            sio.disconnect()
         if log_state['file'] and not log_state['file'].closed:
             log_state['file'].close()
             print(f"\nLog file closed: {log_state['filename']}", file=sys.stderr)
@@ -423,6 +478,11 @@ Common Master Servers:
         default=None,
         help="Run for specified minutes then exit automatically"
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show verbose socketio/engineio messages"
+    )
     args = parser.parse_args()
-    main(callsign_filter=args.callsign, dest_filter=args.talkgroup, peer_filter=args.peer, show_name=args.name, enable_logging=args.log, runtime_minutes=args.runtime)
+    main(callsign_filter=args.callsign, dest_filter=args.talkgroup, peer_filter=args.peer, show_name=args.name, enable_logging=args.log, runtime_minutes=args.runtime, verbose=args.verbose)
 
